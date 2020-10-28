@@ -57,6 +57,18 @@ options:
                 description:
                     - The Public SSH Key used to access the cluster.
                 required: true
+    windows_profile:
+        description:
+            - The Windows profile suboptions.
+        suboptions:
+            admin_username:
+                description:
+                    - The administrator username to use for Windows VMs.
+                required: true
+            admin_password:
+                description:
+                    - The The administrator password to use for Windows VMs.
+                required: true
     agent_pool_profiles:
         description:
             - The agent pool profile suboptions.
@@ -81,6 +93,13 @@ options:
                 description:
                     - To enable auto-scaling.
                 type: bool
+            os_type:
+                description:
+                    - OsType to be used to specify os type
+                choices:
+                    - 'Linux'
+                    - 'Windows'
+                type: str
             max_count:
                 description:
                     - Maximum number of nodes for auto-scaling.
@@ -245,16 +264,28 @@ EXAMPLES = '''
         resource_group: myResourceGroup
         location: eastus
         dns_prefix: akstest
-        kubernetes_version: 1.14.6
+        kubernetes_version: 1.18.8
         linux_profile:
           admin_username: azureuser
           ssh_key: ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAA...
+        windows_profile:
+          admin_username: azzureuser
+          admin_password: P@ssw0rd1234
         service_principal:
           client_id: "cf72ca99-f6b9-4004-b0e0-bee10c521948"
           client_secret: "Password1234!"
         agent_pool_profiles:
-          - name: default
+          - name: linpool
             count: 1
+            vm_size: Standard_DS1_v2
+            enable_auto_scaling: True
+            type: VirtualMachineScaleSets
+            max_count: 3
+            min_count: 1
+            enable_rbac: yes
+          - name: winpool
+            count: 1
+            os_type: Windows
             vm_size: Standard_DS1_v2
             enable_auto_scaling: True
             type: VirtualMachineScaleSets
@@ -344,6 +375,7 @@ def create_aks_dict(aks):
         kubernetes_version=aks.kubernetes_version,
         tags=aks.tags,
         linux_profile=create_linux_profile_dict(aks.linux_profile),
+        windows_profile=create_windows_profile_dict(aks.windows_profile),
         service_principal_profile=create_service_principal_profile_dict(
             aks.service_principal_profile),
         provisioning_state=aks.provisioning_state,
@@ -398,6 +430,18 @@ def create_linux_profile_dict(linuxprofile):
         admin_username=linuxprofile.admin_username
     )
 
+def create_windows_profile_dict(windowsprofile):
+    '''
+    Helper method to deserialize a ContainerServiceLinuxProfile to a dict
+    :param: linuxprofile: ContainerServiceLinuxProfile with the Azure callback object
+    :return: dict with the state on Azure
+    '''
+    if windowsprofile is None:
+        return None
+    return dict(
+        admin_password=windowsprofile.admin_password,
+        admin_username=windowsprofile.admin_username
+    )
 
 def create_service_principal_profile_dict(serviceprincipalprofile):
     '''
@@ -460,9 +504,14 @@ linux_profile_spec = dict(
     ssh_key=dict(type='str', required=True)
 )
 
+windows_profile_spec = dict(
+    admin_username=dict(type='str', required=True),
+    admin_password=dict(type='str', required=True)
+)
+
 
 service_principal_spec = dict(
-    client_id=dict(type='str', required=True),
+    client_id=dict(type='str', required=True),2
     client_secret=dict(type='str', no_log=True)
 )
 
@@ -535,6 +584,10 @@ class AzureRMManagedCluster(AzureRMModuleBase):
                 type='dict',
                 options=linux_profile_spec
             ),
+            windows_profile=dict(
+                type='dict',
+                options=windows_profile_spec
+            ),
             agent_pool_profiles=dict(
                 type='list',
                 elements='dict',
@@ -573,6 +626,7 @@ class AzureRMManagedCluster(AzureRMModuleBase):
         self.tags = None
         self.state = None
         self.linux_profile = None
+        self.windows_profile = None
         self.agent_pool_profiles = None
         self.service_principal = None
         self.enable_rbac = False
@@ -611,10 +665,10 @@ class AzureRMManagedCluster(AzureRMModuleBase):
 
         # Check if the AKS instance already present in the RG
         if self.state == 'present':
-            # For now Agent Pool cannot be more than 1, just remove this part in the future if it change
-            agentpoolcount = len(self.agent_pool_profiles)
-            if agentpoolcount > 1:
-                self.fail('You cannot specify more than one agent_pool_profiles currently')
+            ## For now Agent Pool cannot be more than 1, just remove this part in the future if it change
+            #agentpoolcount = len(self.agent_pool_profiles)
+            #if agentpoolcount > 1:
+            #    self.fail('You cannot specify more than one agent_pool_profiles currently')
 
             available_versions = self.get_all_versions()
             if not response:
@@ -630,6 +684,9 @@ class AzureRMManagedCluster(AzureRMModuleBase):
                 if response['provisioning_state'] == "Succeeded":
 
                     def is_property_changed(profile, property, ignore_case=False):
+                        # Some profiles are optional and may be None
+                        if getattr(self, profile) is None:
+                            return
                         base = response[profile].get(property)
                         new = getattr(self, profile).get(property)
                         if ignore_case:
@@ -652,6 +709,14 @@ class AzureRMManagedCluster(AzureRMModuleBase):
                                   .format(response['linux_profile']['admin_username'], self.linux_profile.get('admin_username'))))
                         to_be_updated = True
                         # self.module.warn("linux_profile.admin_username cannot be updated")
+
+                    # Check windows_profile
+                    if is_property_changed('windows_profile', 'admin_password'):
+                        self.log(("Windows Profile Diff Admin Password was {0} / Now {1}"
+                                  . format(response['windows_profile']['admin_password'], self.windows_profile.get('admin_password'))))
+                    if is_property_changed('windows_profile', 'admin_username'):
+                        self.log(("Windows Profile Diff User was {0} / Now {1}"
+                                  . format(response['windows_profile']['admin_username'], self.windows_profile.get('admin_username'))))
 
                     # Cannot have more that one agent pool profile for now
                     if len(response['agent_pool_profiles']) != len(self.agent_pool_profiles):
@@ -781,6 +846,7 @@ class AzureRMManagedCluster(AzureRMModuleBase):
             service_principal_profile=service_principal_profile,
             agent_pool_profiles=agentpools,
             linux_profile=self.create_linux_profile_instance(self.linux_profile),
+            windows_profile=self.create_windows_profile_instance(self.windows_profile),
             enable_rbac=self.enable_rbac,
             network_profile=self.create_network_profile_instance(self.network_profile),
             aad_profile=self.create_aad_profile_instance(self.aad_profile),
@@ -895,6 +961,19 @@ class AzureRMManagedCluster(AzureRMModuleBase):
             admin_username=linuxprofile['admin_username'],
             ssh=self.managedcluster_models.ContainerServiceSshConfiguration(public_keys=[
                 self.managedcluster_models.ContainerServiceSshPublicKey(key_data=str(linuxprofile['ssh_key']))])
+        )
+
+    def create_windows_profile_instance(self, windowsprofile):
+        '''
+        Helper method to serialize a dict to a ContainerServiceLinuxProfile
+        :param: linuxprofile: dict with the parameters to setup the ContainerServiceLinuxProfile
+        :return: ContainerServiceLinuxProfile
+        '''
+        if windowsprofile is None:
+            return None
+        return self.managedcluster_models.ManagedClusterWindowsProfile(
+            admin_username=windowsprofile['admin_username'],
+            admin_password=windowsprofile['admin_password']
         )
 
     def create_network_profile_instance(self, network):
